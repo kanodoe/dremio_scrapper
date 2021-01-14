@@ -1,92 +1,121 @@
 package main
 
 import (
-	"fmt"
-	"github.com/PuerkitoBio/goquery"
+	"bytes"
+	"encoding/json"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
-	"time"
 )
 
 const (
-	baseUrl = ""
+	baseUrl = "[base.url.here]"
 )
 
 var (
-	username = ""
-	password = ""
+	username = "[your.username]"
+	password = "[your.password]"
 	token    = ""
 )
 
 type App struct {
 	Client *http.Client
-	Token  string
 }
 
-type Project struct {
-	Name string
+type DremioResponse struct {
+	Token                     string `json:"token"`
+	UserName                  string `json:"userName"`
+	FirstName                 string `json:"firstName"`
+	LastName                  string `json:"lastName"`
+	Expires                   int64  `json:"expires"`
+	Email                     string `json:"email"`
+	UserID                    string `json:"userId"`
+	Admin                     bool   `json:"admin"`
+	ClusterID                 string `json:"clusterId"`
+	ClusterCreatedAt          int64  `json:"clusterCreatedAt"`
+	ShowUserAndUserProperties bool   `json:"showUserAndUserProperties"`
+	Version                   string `json:"version"`
+	Permissions               struct {
+		CanUploadProfiles   bool `json:"canUploadProfiles"`
+		CanDownloadProfiles bool `json:"canDownloadProfiles"`
+		CanEmailForSupport  bool `json:"canEmailForSupport"`
+		CanChatForSupport   bool `json:"canChatForSupport"`
+	} `json:"permissions"`
+	UserCreatedAt int64 `json:"userCreatedAt"`
 }
 
-type JobCollection struct {
-	JobsList []JobData
-}
-
-type JobData struct {
-	Status    string
-	Dataset   string
-	User      string
-	StartTime time.Time
-	Duration  time.Duration
-	EndTime   time.Time
-}
-
-func (app *App) setToken(resp *http.Response) {
-
-	document, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		log.Fatalln("Error loading HTTP response body. ", err)
-	}
-
-	token = document.Find("token").Text()
-
+type Jobs struct {
+	Jobs []struct {
+		ID          string `json:"id"`
+		State       string `json:"state"`
+		FailureInfo struct {
+			Errors []interface{} `json:"errors"`
+			Type   string        `json:"type"`
+		} `json:"failureInfo"`
+		User                 string   `json:"user"`
+		StartTime            int64    `json:"startTime"`
+		EndTime              int64    `json:"endTime"`
+		Description          string   `json:"description"`
+		DatasetPathList      []string `json:"datasetPathList"`
+		DatasetType          string   `json:"datasetType"`
+		RequestType          string   `json:"requestType"`
+		Accelerated          bool     `json:"accelerated"`
+		DatasetVersion       string   `json:"datasetVersion"`
+		SnowflakeAccelerated bool     `json:"snowflakeAccelerated"`
+		Spilled              bool     `json:"spilled"`
+		OutputRecords        int      `json:"outputRecords"`
+		OutputLimited        bool     `json:"outputLimited"`
+		IsComplete           bool     `json:"isComplete"`
+	} `json:"jobs"`
+	Next string `json:"next"`
 }
 
 func (app *App) login() {
 	client := app.Client
 
-	loginURL := baseUrl + "/login?redirect=%2F"
+	loginURL := baseUrl + "/apiv2/login"
 
-	data := url.Values{
-		"userName": {username},
-		"password": {password},
-	}
+	data, _ := json.Marshal(map[string]string{
+		"userName": username,
+		"password": password,
+	})
 
-	response, err := client.PostForm(loginURL, data)
+	responseBody := bytes.NewBuffer(data)
 
+	response, err := client.Post(loginURL, "application/json", responseBody)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	app.setToken(response)
-
 	defer response.Body.Close()
+
+	var dremioResponse = new(DremioResponse)
+
+	body, err := ioutil.ReadAll(response.Body)
+	errJson := json.Unmarshal(body, &dremioResponse)
+	if errJson != nil {
+		log.Fatalln(errJson)
+	}
+
+	log.Printf("s = %v", dremioResponse)
 
 	_, err = ioutil.ReadAll(response.Body)
 	if err != nil {
 		log.Fatalln(err)
 	}
+
+	token = dremioResponse.Token
 }
 
-func (app *App) getJobs() []JobData {
-	projectUrl := baseUrl + "/jobs?filters=%7B\"qt\"%3A%5B\"UI\"%2C\"EXTERNAL\"%5D%7D&order=DESCENDING&sort=st#20020a1f-8730-04c3-9981-e24af2714600"
+func (app *App) getJobs() *Jobs {
+	projectUrl := baseUrl + "/apiv2/jobs/?sort=st&order=DESCENDING&filter=(qt%3D%3D%22UI%22%2Cqt%3D%3D%22EXTERNAL%22)"
 	client := app.Client
 
 	req, err := http.NewRequest("GET", projectUrl, nil)
 
-	req.Header.Add("authorization", token)
+	req.Header.Add("Authorization", "_dremio"+token)
+	req.Header.Add("Content-Type", "application/json")
 	response, err := client.Do(req)
 
 	if err != nil {
@@ -95,30 +124,27 @@ func (app *App) getJobs() []JobData {
 
 	defer response.Body.Close()
 
-	document, err := goquery.NewDocumentFromReader(response.Body)
-	if err != nil {
-		log.Fatalln("Error loading HTTP response body. ", err)
+	var jobs = new(Jobs)
+
+	body, err := ioutil.ReadAll(response.Body)
+	log.Println("Body response: ", string(body))
+	errJson := json.Unmarshal(body, jobs)
+	if errJson != nil {
+		log.Fatalln(errJson)
 	}
 
-	var jobs []JobData
-
-	document.Find(".jobs-table-tr").Each(func(i int, selection *goquery.Selection) {
-		job := JobData{}
-
-		status, ok := selection.Children().Children().Attr("TextHighlight")
-		if ok {
-			println("status found: ", status)
-			job.Status = status
-		}
-
-		dataset, ok := selection.Attr("TextHighlight")
-		if ok {
-			job.Dataset = dataset
-		}
-
-	})
+	_, err = ioutil.ReadAll(response.Body)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	return jobs
+
+}
+
+func (jobs *Jobs) FromJson(response []byte) error {
+	var data = &jobs.Jobs
+	return json.Unmarshal(response, data)
 }
 
 func main() {
@@ -131,7 +157,5 @@ func main() {
 	app.login()
 	jobs := app.getJobs()
 
-	for index, job := range jobs {
-		fmt.Println(index+1, job.Status)
-	}
+	log.Printf("s = %v", jobs)
 }
