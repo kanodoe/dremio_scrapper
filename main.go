@@ -3,19 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/andybrewer/mack"
+	"github.com/gen2brain/beeep"
+	"github.com/prprprus/scheduler"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
+	"runtime"
 )
 
 const (
-	baseUrl = "[base.url.here]"
+	baseUrl = ""
 )
 
 var (
-	username = "[your.username]"
-	password = "[your.password]"
+	username = ""
+	password = ""
 	token    = ""
 )
 
@@ -88,7 +92,11 @@ func (app *App) login() {
 		log.Fatalln(err)
 	}
 
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			log.Fatalln(err)
+		}
+	}()
 
 	var dremioResponse = new(DremioResponse)
 
@@ -97,8 +105,6 @@ func (app *App) login() {
 	if errJson != nil {
 		log.Fatalln(errJson)
 	}
-
-	log.Printf("s = %v", dremioResponse)
 
 	_, err = ioutil.ReadAll(response.Body)
 	if err != nil {
@@ -113,6 +119,9 @@ func (app *App) getJobs() *Jobs {
 	client := app.Client
 
 	req, err := http.NewRequest("GET", projectUrl, nil)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	req.Header.Add("Authorization", "_dremio"+token)
 	req.Header.Add("Content-Type", "application/json")
@@ -122,12 +131,16 @@ func (app *App) getJobs() *Jobs {
 		log.Fatalln("Error fetching response. ", err)
 	}
 
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			log.Fatalln(err)
+		}
+	}()
 
 	var jobs = new(Jobs)
 
 	body, err := ioutil.ReadAll(response.Body)
-	log.Println("Body response: ", string(body))
+
 	errJson := json.Unmarshal(body, jobs)
 	if errJson != nil {
 		log.Fatalln(errJson)
@@ -138,13 +151,40 @@ func (app *App) getJobs() *Jobs {
 		log.Fatalln(err)
 	}
 
-	return jobs
+	app.filterJobs(jobs)
 
+	return jobs
 }
 
-func (jobs *Jobs) FromJson(response []byte) error {
-	var data = &jobs.Jobs
-	return json.Unmarshal(response, data)
+func (app *App) filterJobs(jobs *Jobs) {
+
+	for _, v := range jobs.Jobs {
+		if v.State == "FAILED" {
+
+			println("encontre un error en: ", v.ID)
+
+			if runtime.GOOS == "darwin" {
+				errSay := mack.Say("Alerta  ha ocurrido un error de reflexion en dremio!")
+				if errSay != nil {
+					log.Fatalln(errSay)
+				}
+				_, errAlert := mack.Alert("Alerta", "Ha ocurrido un error de la reflexion "+v.FailureInfo.Type, "critical")
+				if errAlert != nil {
+					log.Fatalln(errAlert)
+				}
+
+				errNotify := mack.Notify("Favor de ver reflexiones en dremio", "WIC", "Alerta", "Ping")
+				if errNotify != nil {
+					log.Fatalln(errNotify)
+				}
+			} else if runtime.GOOS == "windows" {
+				err := beeep.Alert("Alerta", "Ha ocurrido un error de la reflexion "+v.FailureInfo.Type, "assets/warning.png")
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+	}
 }
 
 func main() {
@@ -154,8 +194,15 @@ func main() {
 		Client: &http.Client{Jar: jar},
 	}
 
-	app.login()
-	jobs := app.getJobs()
+	s, err := scheduler.NewScheduler(1000)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
-	log.Printf("s = %v", jobs)
+	if len(token) < 1 {
+		app.login()
+	}
+
+	s.Delay().Minute(10).Do(app.getJobs())
+
 }
