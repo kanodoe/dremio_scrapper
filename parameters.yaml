@@ -1,0 +1,15 @@
+urls:
+  baseUrl: ""
+  loginPath: ""
+  jobsPath: ""
+loginCredential:
+  username: ""
+  password: ""
+searchParameters:
+  userJobs:
+    - ""
+  dataSet:
+    - ""
+filtersParametersJobs:
+  # Delta de hora(hora)
+  deltaTime: 1
