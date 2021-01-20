@@ -11,6 +11,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"runtime"
+	"fmt"
+	"regexp"
+	"strconv"
+	"time"
+	"strings"
+	"gopkg.in/yaml.v2"
+
 )
 
 const (
@@ -25,6 +32,8 @@ var (
 
 type App struct {
 	Client *http.Client
+	ParametersFile string
+	Rules          Rules
 }
 
 type DremioResponse struct {
@@ -41,7 +50,7 @@ type DremioResponse struct {
 	ShowUserAndUserProperties bool   `json:"showUserAndUserProperties"`
 	Version                   string `json:"version"`
 	Permissions               struct {
-		CanUploadProfiles   bool `json:"canUploadProfiles"`
+		CanUploadProfiles  	bool `json:"canUploadProfiles"`
 		CanDownloadProfiles bool `json:"canDownloadProfiles"`
 		CanEmailForSupport  bool `json:"canEmailForSupport"`
 		CanChatForSupport   bool `json:"canChatForSupport"`
@@ -54,8 +63,9 @@ type Jobs struct {
 		ID          string `json:"id"`
 		State       string `json:"state"`
 		FailureInfo struct {
-			Errors []interface{} `json:"errors"`
-			Type   string        `json:"type"`
+			Message string        `json:"message"`
+			Errors  []interface{} `json:"errors"`
+			Type    string        `json:"type"`
 		} `json:"failureInfo"`
 		User                 string   `json:"user"`
 		StartTime            int64    `json:"startTime"`
@@ -75,23 +85,41 @@ type Jobs struct {
 	Next string `json:"next"`
 }
 
+type Rules struct {
+	Urls struct {
+		Base      		string `yaml:"baseUrl"`
+		LoginPath 		string `yaml:"loginPath"`
+		JobsPath  		string `yaml:"jobsPath"`
+	} `yaml:"urls"`
+	LoginCredential struct {
+		Username 		string `yaml:"username"`
+		Password 		string `yaml:"password"`
+	} `yaml:"loginCredential"`
+	SearchParameters struct {
+		UserJobs		[]string `yaml:"userJobs"`
+		DataSet  		[]string `yaml:"dataSet"`
+	} `yaml:"searchParameters"`
+	FiltersParametersJobs struct {
+		DeltaTime 		int `yaml:"deltaTime"`
+	} `yaml:"filtersParametersJobs"`
+}
+
+func (app *App) init() {
+	app.Rules.getRules(app.ParametersFile)
+}
+
 func (app *App) login() {
 	client := app.Client
-
-	loginURL := baseUrl + "/apiv2/login"
-
+	loginURL := app.Rules.Urls.Base + app.Rules.Urls.LoginPath
 	data, _ := json.Marshal(map[string]string{
-		"userName": username,
-		"password": password,
+		"userName": app.Rules.LoginCredential.Username,
+		"password": app.Rules.LoginCredential.Password,
 	})
-
 	responseBody := bytes.NewBuffer(data)
-
 	response, err := client.Post(loginURL, "application/json", responseBody)
 	if err != nil {
 		log.Fatalln(err)
 	}
-
 	defer func() {
 		if err := response.Body.Close(); err != nil {
 			log.Fatalln(err)
@@ -99,7 +127,6 @@ func (app *App) login() {
 	}()
 
 	var dremioResponse = new(DremioResponse)
-
 	body, err := ioutil.ReadAll(response.Body)
 	errJson := json.Unmarshal(body, &dremioResponse)
 	if errJson != nil {
@@ -110,14 +137,17 @@ func (app *App) login() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-
 	token = dremioResponse.Token
 }
 
 func (app *App) getJobs() *Jobs {
-	projectUrl := baseUrl + "/apiv2/jobs/?sort=st&order=DESCENDING&filter=(qt%3D%3D%22UI%22%2Cqt%3D%3D%22EXTERNAL%22)"
 	client := app.Client
+	params, err := buildQueryParams(app.Rules.FiltersParametersJobs.DeltaTime)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
+	projectUrl := app.Rules.Urls.Base + app.Rules.Urls.JobsPath + params
 	req, err := http.NewRequest("GET", projectUrl, nil)
 	if err != nil {
 		log.Fatalln(err)
@@ -151,47 +181,108 @@ func (app *App) getJobs() *Jobs {
 		log.Fatalln(err)
 	}
 
-	app.filterJobs(jobs)
+	jobs = app.filterJobs(jobs) //jobs
 
+	if len(jobs.Jobs) > 0 {
+		messageError := buildErrorMessage(jobs)
+		notifyError(messageError)
+	} else {
+		fmt.Print("Sin Errores en reflexiones")
+	}
 	return jobs
 }
 
-func (app *App) filterJobs(jobs *Jobs) {
-
+func (app *App) filterJobs(jobs *Jobs) *Jobs {
+	var newjobs Jobs
+	kpiNames := app.Rules.SearchParameters.DataSet
 	for _, v := range jobs.Jobs {
-		if v.State == "FAILED" {
+		for _, item := range kpiNames {
+			nameQuery := v.DatasetPathList[len(v.DatasetPathList)-1]
+			matched, err := regexp.Match(item, []byte(nameQuery))
 
-			println("encontre un error en: ", v.ID)
-
-			if runtime.GOOS == "darwin" {
-				errSay := mack.Say("Alerta  ha ocurrido un error de reflexion en dremio!")
-				if errSay != nil {
-					log.Fatalln(errSay)
-				}
-				_, errAlert := mack.Alert("Alerta", "Ha ocurrido un error de la reflexion "+v.FailureInfo.Type, "critical")
-				if errAlert != nil {
-					log.Fatalln(errAlert)
-				}
-
-				errNotify := mack.Notify("Favor de ver reflexiones en dremio", "WIC", "Alerta", "Ping")
-				if errNotify != nil {
-					log.Fatalln(errNotify)
-				}
-			} else if runtime.GOOS == "windows" {
-				err := beeep.Alert("Alerta", "Ha ocurrido un error de la reflexion "+v.FailureInfo.Type, "assets/warning.png")
-				if err != nil {
-					panic(err)
-				}
+			if err != nil {
+				log.Fatalln(err)
 			}
+			if matched == true {
+				// TODO: Optimize deleting item from kpiNames
+				newjobs.Jobs = append(newjobs.Jobs, v)
+				break
+			}
+		}
+	}
+	return &newjobs
+}
+
+func notifyError(messageError string) {
+	if runtime.GOOS == "darwin" {
+		errSay := mack.Say("Alerta  ha ocurrido un error de reflexion en dremio!")
+		if errSay != nil {
+			log.Fatalln(errSay)
+		}
+		_, errAlert := mack.Alert("Alerta", "Ha ocurrido un(os) error(es):\n"+ messageError, "critical")
+		if errAlert != nil {
+			log.Fatalln(errAlert)
+		}
+
+		errNotify := mack.Notify("Ha ocurrido un(os) error(es):\n"+messageError, "WIC", "Alerta", "Glass")
+		if errNotify != nil {
+			log.Fatalln(errNotify)
+		}
+	} else if runtime.GOOS == "windows" {
+		err := beeep.Alert("Alerta", "Ha ocurrido un(os) error(es): "+messageError, "assets/warning.png") //+v.FailureInfo.Type, "assets/warning.png")
+		if err != nil {
+			panic(err)
 		}
 	}
 }
 
+func buildErrorMessage(jobs *Jobs) string {
+	JobNames := ""
+	for _, v := range jobs.Jobs {
+		pathJob := " - "+strings.Join(v.DatasetPathList[:], "/")
+		JobNames += pathJob + "\n"
+	}
+	return JobNames
+}
+
+func buildQueryParams(deltaTime int) (string, error) {
+	from, to, err := deltaTimeCalculate(deltaTime)
+	if err != nil {
+		return "", fmt.Errorf("Read File err:   #%v ", err)
+	}
+	s := `?limit=1000&sort=st&order=DESCENDING&filter=(qt=="ACCELERATION");(jst=="FAILED");(st=gt=` + from + `;st=lt=` + to + `)`
+	fmt.Println("query: ",s)
+	return s, nil
+}
+
+func deltaTimeCalculate(delta int) (string, string, error) {
+	loc, _ := time.LoadLocation("UTC")
+	now := time.Now().In(loc)
+	oldTime := time.Date(now.Year(), now.Month(), now.Day(), now.Hour()-delta, now.Minute(), now.Second(), 0, time.UTC)
+
+	nowUnix := now.UnixNano()/1000000
+	oldTimeUnix := oldTime.UnixNano()/1000000
+	return strconv.FormatInt(oldTimeUnix, 10), strconv.FormatInt(nowUnix, 10), nil
+}
+
+func (rules *Rules) getRules(path string) error {
+	file, err := ioutil.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("Read File err:   #%v ", err)
+	}
+	err = yaml.Unmarshal(file, &rules)
+	if err != nil {
+		log.Fatalf("Unmarshal: %v", err)
+		return fmt.Errorf("Decode Unmarshal err: %v", err)
+	}
+	return nil
+}
+
 func main() {
 	jar, _ := cookiejar.New(nil)
-
 	app := App{
-		Client: &http.Client{Jar: jar},
+		Client:         &http.Client{Jar: jar},
+		ParametersFile: "parameters.yaml",
 	}
 
 	s, err := scheduler.NewScheduler(1000)
@@ -200,6 +291,7 @@ func main() {
 	}
 
 	if len(token) < 1 {
+		app.init()
 		app.login()
 	}
 
