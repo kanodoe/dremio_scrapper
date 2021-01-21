@@ -3,21 +3,22 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/andybrewer/mack"
-	"github.com/gen2brain/beeep"
-	"github.com/prprprus/scheduler"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
-	"runtime"
-	"fmt"
 	"regexp"
+	"runtime"
 	"strconv"
-	"time"
 	"strings"
-	"gopkg.in/yaml.v2"
+	"time"
 
+	"github.com/andybrewer/mack"
+	"github.com/gen2brain/beeep"
+	"github.com/go-playground/validator/v10"
+	"github.com/prprprus/scheduler"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -31,10 +32,12 @@ var (
 )
 
 type App struct {
-	Client *http.Client
+	Client         *http.Client
 	ParametersFile string
 	Rules          Rules
 }
+
+var validate *validator.Validate
 
 type DremioResponse struct {
 	Token                     string `json:"token"`
@@ -50,7 +53,7 @@ type DremioResponse struct {
 	ShowUserAndUserProperties bool   `json:"showUserAndUserProperties"`
 	Version                   string `json:"version"`
 	Permissions               struct {
-		CanUploadProfiles  	bool `json:"canUploadProfiles"`
+		CanUploadProfiles   bool `json:"canUploadProfiles"`
 		CanDownloadProfiles bool `json:"canDownloadProfiles"`
 		CanEmailForSupport  bool `json:"canEmailForSupport"`
 		CanChatForSupport   bool `json:"canChatForSupport"`
@@ -87,25 +90,27 @@ type Jobs struct {
 
 type Rules struct {
 	Urls struct {
-		Base      		string `yaml:"baseUrl"`
-		LoginPath 		string `yaml:"loginPath"`
-		JobsPath  		string `yaml:"jobsPath"`
+		Base      string `yaml:"baseUrl" validate:"required,url"`
+		LoginPath string `yaml:"loginPath" validate:"required"`
+		JobsPath  string `yaml:"jobsPath" validate:"required"`
 	} `yaml:"urls"`
 	LoginCredential struct {
-		Username 		string `yaml:"username"`
-		Password 		string `yaml:"password"`
+		Username string `yaml:"username" validate:"required"`
+		Password string `yaml:"password" validate:"required"`
 	} `yaml:"loginCredential"`
 	SearchParameters struct {
-		UserJobs		[]string `yaml:"userJobs"`
-		DataSet  		[]string `yaml:"dataSet"`
+		UserJobs []string `yaml:"userJobs" validate:"required"`
+		DataSet  []string `yaml:"dataSet" validate:"required"`
 	} `yaml:"searchParameters"`
 	FiltersParametersJobs struct {
-		DeltaTime 		int `yaml:"deltaTime"`
+		DeltaTime int `yaml:"deltaTime" validate:"min=1"`
 	} `yaml:"filtersParametersJobs"`
 }
 
 func (app *App) init() {
+	validate = validator.New()
 	app.Rules.getRules(app.ParametersFile)
+	app.Rules.validate()
 }
 
 func (app *App) login() {
@@ -115,28 +120,39 @@ func (app *App) login() {
 		"userName": app.Rules.LoginCredential.Username,
 		"password": app.Rules.LoginCredential.Password,
 	})
-	responseBody := bytes.NewBuffer(data)
-	response, err := client.Post(loginURL, "application/json", responseBody)
+	requestBody := bytes.NewBuffer(data)
+	response, err := client.Post(loginURL, "application/json", requestBody)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalln("fatal1 ", err)
 	}
 	defer func() {
 		if err := response.Body.Close(); err != nil {
-			log.Fatalln(err)
+			log.Fatalln("fatal1,1: ", err)
 		}
 	}()
 
+	if response.StatusCode != 200 {
+		log.Fatalln("Login error. Status code: ", response.StatusCode)
+	}
+
 	var dremioResponse = new(DremioResponse)
 	body, err := ioutil.ReadAll(response.Body)
+
 	errJson := json.Unmarshal(body, &dremioResponse)
 	if errJson != nil {
-		log.Fatalln(errJson)
+		log.Fatalln(err)
+		//log.Fatalln(errJson)
 	}
 
 	_, err = ioutil.ReadAll(response.Body)
 	if err != nil {
 		log.Fatalln(err)
+		// log.Fatalln(err)
 	}
+	if len(dremioResponse.Token) == 0 {
+		log.Fatalln("Error: Invalid token")
+	}
+
 	token = dremioResponse.Token
 }
 
@@ -219,7 +235,7 @@ func notifyError(messageError string) {
 		if errSay != nil {
 			log.Fatalln(errSay)
 		}
-		_, errAlert := mack.Alert("Alerta", "Ha ocurrido un(os) error(es):\n"+ messageError, "critical")
+		_, errAlert := mack.Alert("Alerta", "Ha ocurrido un(os) error(es):\n"+messageError, "critical")
 		if errAlert != nil {
 			log.Fatalln(errAlert)
 		}
@@ -239,43 +255,47 @@ func notifyError(messageError string) {
 func buildErrorMessage(jobs *Jobs) string {
 	JobNames := ""
 	for _, v := range jobs.Jobs {
-		pathJob := " - "+strings.Join(v.DatasetPathList[:], "/")
+		pathJob := " - " + strings.Join(v.DatasetPathList[:], "/")
 		JobNames += pathJob + "\n"
 	}
 	return JobNames
 }
 
 func buildQueryParams(deltaTime int) (string, error) {
-	from, to, err := deltaTimeCalculate(deltaTime)
-	if err != nil {
-		return "", fmt.Errorf("Read File err:   #%v ", err)
-	}
+	from, to := deltaTimeCalculate(deltaTime)
 	s := `?limit=1000&sort=st&order=DESCENDING&filter=(qt=="ACCELERATION");(jst=="FAILED");(st=gt=` + from + `;st=lt=` + to + `)`
-	fmt.Println("query: ",s)
 	return s, nil
 }
 
-func deltaTimeCalculate(delta int) (string, string, error) {
+func deltaTimeCalculate(delta int) (string, string) {
 	loc, _ := time.LoadLocation("UTC")
 	now := time.Now().In(loc)
 	oldTime := time.Date(now.Year(), now.Month(), now.Day(), now.Hour()-delta, now.Minute(), now.Second(), 0, time.UTC)
 
-	nowUnix := now.UnixNano()/1000000
-	oldTimeUnix := oldTime.UnixNano()/1000000
-	return strconv.FormatInt(oldTimeUnix, 10), strconv.FormatInt(nowUnix, 10), nil
+	nowUnix := now.UnixNano() / 1000000
+	oldTimeUnix := oldTime.UnixNano() / 1000000
+	return strconv.FormatInt(oldTimeUnix, 10), strconv.FormatInt(nowUnix, 10)
 }
 
-func (rules *Rules) getRules(path string) error {
+func (rules *Rules) getRules(path string) {
 	file, err := ioutil.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("Read File err:   #%v ", err)
+		log.Fatalln("Error read config file: %s", err)
+		panic(err)
 	}
+
 	err = yaml.Unmarshal(file, &rules)
 	if err != nil {
-		log.Fatalf("Unmarshal: %v", err)
-		return fmt.Errorf("Decode Unmarshal err: %v", err)
+		log.Fatalln(err)
 	}
-	return nil
+}
+
+func (rules *Rules) validate() {
+	err := validate.Struct(rules)
+	if err != nil {
+		log.Fatalln("Error Parameter yaml validation : \n", err)
+		panic(err)
+	}
 }
 
 func main() {
@@ -294,7 +314,5 @@ func main() {
 		app.init()
 		app.login()
 	}
-
 	s.Delay().Minute(10).Do(app.getJobs())
-
 }
