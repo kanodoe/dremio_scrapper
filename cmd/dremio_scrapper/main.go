@@ -123,11 +123,11 @@ func (app *App) login() {
 	requestBody := bytes.NewBuffer(data)
 	response, err := client.Post(loginURL, "application/json", requestBody)
 	if err != nil {
-		log.Fatalln("fatal1 ", err)
+		log.Fatalln(err)
 	}
 	defer func() {
 		if err := response.Body.Close(); err != nil {
-			log.Fatalln("fatal1,1: ", err)
+			log.Fatalln(err)
 		}
 	}()
 
@@ -141,13 +141,11 @@ func (app *App) login() {
 	errJson := json.Unmarshal(body, &dremioResponse)
 	if errJson != nil {
 		log.Fatalln(err)
-		//log.Fatalln(errJson)
 	}
 
 	_, err = ioutil.ReadAll(response.Body)
 	if err != nil {
 		log.Fatalln(err)
-		// log.Fatalln(err)
 	}
 	if len(dremioResponse.Token) == 0 {
 		log.Fatalln("Error: Invalid token")
